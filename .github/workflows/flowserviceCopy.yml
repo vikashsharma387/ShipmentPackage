@@ -1,0 +1,92 @@
+name: Copy wmio flow service from reference source project to multiple projects
+'on':
+  workflow_dispatch:
+    inputs:
+      flowService:
+        description: Name of the flow service
+        required: true
+      sourceProjectId:
+        description: Identifier of the source project (uid)
+        required: true
+      commitMessage:
+        description: Message to include with commit of flow service definition
+        required: true
+jobs:
+  copy-flow-services:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          token: '${{ secrets.GH_TOKEN }}'
+      - name: Export the flow service definition
+        run: >
+          # Get the source project's flow service download link
+
+          DOWNLOAD_LINK=$(curl -s -u "${{ secrets.WMIO_USERNAME }}:${{
+          secrets.WMIO_PASSWORD }}" \
+            --request POST "${{ secrets.WMIO_URL }}/apis/v1/rest/projects/${{ github.event.inputs.sourceProjectId }}/flows/${{ github.event.inputs.flowService }}/export" | jq -r '.output.download_link')
+          if [ -z "$DOWNLOAD_LINK" ]; then
+            echo "Failure to retrieve flow service download link"
+            exit 1
+          fi
+
+          # Download the flow service zip archive
+
+          mkdir -p flow-services
+
+          curl -s "$DOWNLOAD_LINK" -o flow-services/${{
+          github.event.inputs.flowService }}.zip
+
+          if unzip -t "flow-services/${{ github.event.inputs.flowService }}.zip"
+          >/dev/null 2>&1; then
+            echo "Exported flow service zip is valid."
+          else
+            echo "Exported flow service zip is corrupted."
+            exit 1
+          fi
+      - name: Push the new definition to vcs
+        run: |
+          # Push the new flow service version to the git remote
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add flow-services/${{ github.event.inputs.flowService }}.zip
+          git commit -m "${{ github.event.inputs.commitMessage }}"
+          git push
+      - name: Update the flow service definition in all projects where it is used
+        run: >
+          # Get the list of projects
+
+          PROJECTS=$(curl -s -u "${{ secrets.WMIO_USERNAME }}:${{
+          secrets.WMIO_PASSWORD }}" "${{ secrets.WMIO_URL
+          }}/apis/v1/rest/projects" | jq -r .output.projects | jq -c '.[]')
+
+          if [ -z "$PROJECTS" ]; then
+              echo "Failure to retrieve list of projects"
+              exit 1
+          fi 
+
+          # Iterate over the list of projects to import the new flow service
+          version
+
+          for project in $PROJECTS; do
+              PROJECT_NAME=$(echo "$project" | jq -r '.name')
+              PROJECT_UID=$(echo "$project" | jq -r '.uid')
+              FLOW_SERVICES=$(curl -s -u "${{ secrets.WMIO_USERNAME }}:${{ secrets.WMIO_PASSWORD }}" "${{ secrets.WMIO_URL }}/apis/v1/rest/projects/$PROJECT_UID/assets" | jq -r '.output.flows[]')
+              # Check if the flow service is in the list of flows using Bash
+              if echo "$FLOW_SERVICES" | grep -q -w "${{ github.event.inputs.flowService }}"; then
+                  # We don't update the flow service in the source project
+                  if [ "$PROJECT_UID" != "${{ github.event.inputs.sourceProjectId }}" ]; then
+                      RESPONSE=$(curl -s -u "${{ secrets.WMIO_USERNAME }}:${{ secrets.WMIO_PASSWORD }}" \
+                        --request POST "${{ secrets.WMIO_URL }}/apis/v1/rest/projects/$PROJECT_UID/flow-import" \
+                        --form "recipe=@$(pwd)/flow-services/${{ github.event.inputs.flowService }}.zip")
+                      ERROR=$(echo $RESPONSE | jq -r '.error.message')
+                      if [ -n "$ERROR" ] && [ "$ERROR" != "null" ]; then
+                        echo "Project $PROJECT_NAME not updated: $RESPONSE"
+                        exit 1
+                      else
+                        echo "Project $PROJECT_NAME updated"
+                      fi
+                  fi
+              fi
+          done
